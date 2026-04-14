@@ -422,54 +422,109 @@ def _estimate_grid_params(std_signal, expected_size=None, min_length=8):
 
 
 def auto_split_icons(roi_img, empty_std_threshold=15.0):
-    """아이콘이 정사각형이라고 가정하고 ROI를 격자로 분할.
-    1) 행/열 분석으로 아이콘 크기 + 간격(피치) 추정
-    2) 피치 간격으로 격자 생성 (간격 고려)
-    3) 편차 낮은 셀(빈 칸)은 제외
+    """ROI 안에서 개별 버프 아이콘을 감지.
+
+    격자 분할 대신 슬라이딩 윈도우 + 비최대 억제(NMS)로 개별 아이콘
+    위치를 찾는다. 아이콘 순서나 간격이 달라도 정확하게 감지.
+
+    점수 기준: 내부 변동(0.3) + 색 채도(0.4) + 엣지 밀도(0.3)
+    게임 배경 텍스처는 채도가 낮고 엣지가 불규칙해서 걸러진다.
 
     반환: [(col, row, bgr_img), ...]"""
     if roi_img is None or roi_img.size == 0:
         return []
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
     H, W = gray.shape
 
-    # 세로(행) 분석으로 아이콘 크기 결정
+    # 아이콘 크기 추정 (세로 컨텐츠 블록 길이)
     row_std = gray.std(axis=1)
-    cell_h, step_y, y_off = _estimate_grid_params(row_std)
+    blocks = _find_content_blocks(row_std, min_length=8)
+    if blocks:
+        bs = int(np.median([l for _, l in blocks]))
+        if bs < 12:
+            bs = FALLBACK_ICON_SIZE
+    else:
+        bs = FALLBACK_ICON_SIZE
 
-    # 아이콘은 정사각형 → 세로 기준 크기 우선 사용
-    size = cell_h or FALLBACK_ICON_SIZE
-    if size < 12:
-        size = FALLBACK_ICON_SIZE
-
-    # 가로(열) 분석 — expected_size 전달하여 합쳐진 블록 세분화
-    col_std = gray.std(axis=0)
-    _cw, step_x, x_off = _estimate_grid_params(col_std, expected_size=size)
-
-    step_y = step_y or size
-    step_x = step_x or size
-
-    # ROI가 너무 작으면 포기
-    if H < size or W < size:
+    if H < bs or W < bs:
         return []
 
-    # 그리드 셀 수 계산 (첫 아이콘 시작 + 피치 * n이 ROI 안에 들어오는 수)
-    rows = 1 + max(0, (H - y_off - size) // step_y) if step_y > 0 else 1
-    cols = 1 + max(0, (W - x_off - size) // step_x) if step_x > 0 else 1
+    # --- Phase 1: 슬라이딩 윈도우로 아이콘 후보 점수화 ---
+    step = max(2, bs // 6)
+    candidates = []
+
+    for y in range(0, H - bs + 1, step):
+        for x in range(0, W - bs + 1, step):
+            pg = gray[y:y + bs, x:x + bs]
+            var = pg.std()
+            if var < empty_std_threshold:
+                continue
+
+            sat = float(hsv[y:y + bs, x:x + bs, 1].mean())
+            edges = cv2.Canny(pg, 40, 120)
+            edge_r = float(edges.sum()) / (bs * bs * 255)
+
+            score = (min(var / 50, 1) * 0.3
+                     + min(sat / 60, 1) * 0.4
+                     + min(edge_r / 0.12, 1) * 0.3)
+
+            if score > 0.3:
+                candidates.append((x, y, score))
+
+    if not candidates:
+        return []
+
+    # --- Phase 2: 비최대 억제 (NMS) ---
+    candidates.sort(key=lambda c: -c[2])
+    selected = []
+    for x, y, sc in candidates:
+        if not any(abs(x - sx) < bs * 0.6 and abs(y - sy) < bs * 0.6
+                   for sx, sy, _ in selected):
+            selected.append((x, y, sc))
+
+    if not selected:
+        return []
+
+    # --- Phase 3: 위치 미세 보정 (±step 범위에서 최고 점수 탐색) ---
+    refined = []
+    for x, y, sc in selected:
+        bx, by, bsc = x, y, sc
+        for dy in range(-step, step + 1):
+            for dx in range(-step, step + 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx <= W - bs and 0 <= ny <= H - bs:
+                    pg = gray[ny:ny + bs, nx:nx + bs]
+                    var = pg.std()
+                    if var < empty_std_threshold:
+                        continue
+                    sat = float(hsv[ny:ny + bs, nx:nx + bs, 1].mean())
+                    edges = cv2.Canny(pg, 40, 120)
+                    er = float(edges.sum()) / (bs * bs * 255)
+                    s2 = (min(var / 50, 1) * 0.3
+                          + min(sat / 60, 1) * 0.4
+                          + min(er / 0.12, 1) * 0.3)
+                    if s2 > bsc:
+                        bx, by, bsc = nx, ny, s2
+        refined.append((bx, by, bsc))
+    selected = refined
+
+    # --- Phase 4: 열/행 할당 ---
+    selected.sort(key=lambda s: s[0])
+    columns = [[selected[0]]]
+    for item in selected[1:]:
+        if abs(item[0] - columns[-1][-1][0]) < bs * 0.5:
+            columns[-1].append(item)
+        else:
+            columns.append([item])
 
     icons = []
-    for r in range(rows):
-        for c in range(cols):
-            y1 = y_off + r * step_y
-            x1 = x_off + c * step_x
-            y2 = y1 + size
-            x2 = x1 + size
-            if y2 > H or x2 > W or y1 < 0 or x1 < 0:
-                continue
-            cell = roi_img[y1:y2, x1:x2]
-            if cell.std() < empty_std_threshold:
-                continue  # 빈 칸
-            icons.append((c, r, cell))
+    for c_idx, col in enumerate(columns):
+        col.sort(key=lambda item: item[1])
+        for r_idx, (x, y, _) in enumerate(col):
+            icon = roi_img[y:y + bs, x:x + bs]
+            icons.append((c_idx, r_idx, icon))
+
     return icons
 
 
@@ -552,12 +607,19 @@ def review_dialog(parent, saved_icons):
     win = tk.Toplevel(parent)
     win.title("자동 분리 결과 확인")
     win.attributes("-topmost", True)
-    win.geometry("700x520")
+
+    # 아이콘 표시 크기 결정 (최소 48px로 확대)
+    display_px = 56
+    grid_cols = min(10, len(saved_icons))
+    cell_px = display_px + 14  # border + padding
+    need_w = max(500, grid_cols * cell_px + 80)
+    need_w = min(need_w, parent.winfo_screenwidth() - 100)
+    win.geometry(f"{need_w}x600")
 
     tk.Label(win,
              text=(f"총 {len(saved_icons)}개 감지됨. "
                    "잘못 잡힌 항목은 클릭(빨강)해서 제외하세요."),
-             fg="gray", wraplength=660, justify="left").pack(pady=6, padx=10, anchor="w")
+             fg="gray", wraplength=need_w - 40, justify="left").pack(pady=6, padx=10, anchor="w")
 
     area = tk.Canvas(win, highlightthickness=0)
     sb = tk.Scrollbar(win, orient="vertical", command=area.yview)
@@ -572,10 +634,10 @@ def review_dialog(parent, saved_icons):
     area.bind_all("<MouseWheel>", wheel)
 
     keep, frames, photos = {}, {}, []
-    cols = 10
+    cols = grid_cols
     for i, (name, img) in enumerate(saved_icons):
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        k = max(1, 40 // max(rgb.shape[0], 1))
+        k = max(1, display_px // max(rgb.shape[0], rgb.shape[1], 1))
         if k > 1:
             rgb = cv2.resize(rgb, None, fx=k, fy=k, interpolation=cv2.INTER_NEAREST)
         ph = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -883,18 +945,52 @@ def main():
                 status.config(text="ROI 수동 지정됨", fg="blue")
 
     def do_save():
-        if not (state["window_title"] and state["roi_rel"]):
-            messagebox.showwarning("안내", "창과 ROI를 먼저 지정하세요.")
-            return
+        # --- 원클릭 흐름: 창 찾기 → ROI 감지 → 아이콘 분리 전부 자동 ---
+
+        # 1) 창 자동 탐색
+        if not state["window_title"]:
+            t = auto_find_game_window()
+            if t:
+                state["window_title"] = t
+                save_config(state); refresh_info()
+            else:
+                t = pick_window_dialog(root)
+                if not t:
+                    return
+                state["window_title"] = t
+                save_config(state); refresh_info()
+
         rect = get_window_rect(state["window_title"])
         if rect is None:
             messagebox.showerror("에러", "창을 찾지 못했어요.")
             return
+
+        full = grab_rect(rect)
+
+        # 2) ROI 자동 감지
+        if not state["roi_rel"]:
+            roi = auto_detect_buff_roi(full)
+            if roi:
+                state["roi_rel"] = roi
+                save_config(state); refresh_info()
+            else:
+                # ROI 자동 실패 → 수동 드래그
+                roi = pick_roi_on_image(full, root)
+                if not roi:
+                    return
+                state["roi_rel"] = roi
+                save_config(state); refresh_info()
+
+        # 3) 템플릿 저장 (auto_split_icons가 NMS 기반으로 개별 감지)
         n, saved = save_templates(rect, state["roi_rel"])
         if n == -1:
             messagebox.showerror("에러", "ROI가 창 밖으로 나갔습니다.")
         elif n == 0:
-            messagebox.showerror("에러", "아이콘 감지 실패. ROI를 다시 잡아보세요.")
+            messagebox.showerror("에러",
+                                 "아이콘 감지 실패.\n"
+                                 "ROI를 수동으로 다시 선택하세요.")
+            state["roi_rel"] = None
+            save_config(state); refresh_info()
         else:
             final = review_dialog(root, saved)
             if final == -1:
