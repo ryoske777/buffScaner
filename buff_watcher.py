@@ -98,76 +98,100 @@ def auto_find_game_window():
 def auto_detect_buff_roi(bgr_img):
     """게임 스크린샷 우측에서 버프 바를 자동 감지.
 
-    RO 버프 바는 우측 가장자리에 위치하며, 작은 정사각형 아이콘이
-    세로로 나열되어 있다. 타일 분석으로 세로 연속 아이콘 열을 찾는다.
+    방법: 우측 가장자리의 좁은 세로 스트립에서 행별 std 프로파일의
+    자기상관(autocorrelation)을 계산하여 '일정 간격으로 반복되는
+    아이콘 격자' 패턴을 탐지한다.
+    나무/돌 등 게임 텍스처는 이런 규칙적 주기가 없어 구분됨.
 
     반환: (x, y, w, h) 창 내부 상대좌표 또는 None
     """
     h, w = bgr_img.shape[:2]
 
-    # 우측 15% 스캔 (최소 100px)
-    scan_w = max(100, min(int(w * 0.15), w))
+    # 우측 가장자리만 스캔 (RO 버프 바는 맨 오른쪽에 위치)
+    scan_w = min(100, max(50, int(w * 0.10)))
     right = bgr_img[:, w - scan_w:]
     gray = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
 
-    bs = FALLBACK_ICON_SIZE  # 24px 타일
-    ny, nx = h // bs, scan_w // bs
-    if ny < 3 or nx < 1:
+    bs = FALLBACK_ICON_SIZE  # 24
+    best_x, best_score, best_strip_w = -1, 0.0, bs
+
+    # 1열(bs) 및 2열(bs*2+gap) 스트립을 슬라이딩하며 주기 패턴 탐색
+    for strip_w in [bs, bs * 2 + 2, bs * 2 + 4, bs * 2]:
+        if strip_w > scan_w:
+            continue
+        for x in range(max(0, scan_w - strip_w - 10),
+                       min(scan_w - strip_w + 1, scan_w), 2):
+            strip = gray[:, x:x + strip_w]
+            # 행별 표준편차 = 세로 컨텐츠 프로파일
+            prof = strip.std(axis=1).astype(np.float64)
+            centered = prof - prof.mean()
+            norm = np.sqrt(np.sum(centered ** 2))
+            if norm < 1e-6:
+                continue
+            normed = centered / norm
+
+            # 예상 아이콘 피치(24~32px)에서 자기상관 최대값 탐색
+            for lag in range(bs - 2, bs + 10):
+                n = len(normed) - lag
+                if n < lag * 3:      # 최소 3주기 필요
+                    continue
+                corr = float(np.dot(normed[:n], normed[lag:lag + n]))
+                # 주기 수에 비례한 가중 (긴 버프 바 우선)
+                n_periods = n / lag
+                score = corr * min(n_periods, 10) / 10
+                if score > best_score:
+                    best_score = score
+                    best_x = x
+                    best_strip_w = strip_w
+
+    if best_score < 0.15 or best_x < 0:
         return None
 
-    # 각 타일의 표준편차 계산
-    tile_std = np.zeros((ny, nx))
-    for ty in range(ny):
-        for tx in range(nx):
-            tile = gray[ty * bs:(ty + 1) * bs, tx * bs:(tx + 1) * bs]
-            if tile.size > 0:
-                tile_std[ty, tx] = tile.std()
+    # 주기 패턴이 있는 세로 구간 찾기
+    strip = gray[:, best_x:best_x + best_strip_w]
+    prof = strip.std(axis=1)
+    content_thresh = max(12, prof.mean() * 0.8)
+    is_content = prof > content_thresh
 
-    # std > 임계값 = "아이콘 후보"
-    icon_thresh = 15.0
-    is_icon = tile_std > icon_thresh
+    # 연속 구간 찾기
+    runs = []
+    in_run, start = False, 0
+    for y in range(len(is_content)):
+        if is_content[y] and not in_run:
+            start = y; in_run = True
+        elif not is_content[y] and in_run:
+            runs.append((start, y)); in_run = False
+    if in_run:
+        runs.append((start, len(is_content)))
 
-    # 각 타일 열에서 가장 긴 세로 연속 아이콘 구간 찾기
-    best_col, best_run, best_y = -1, 0, 0
-    for tx in range(nx):
-        run_len, run_start = 0, 0
-        for ty in range(ny):
-            if is_icon[ty, tx]:
-                if run_len == 0:
-                    run_start = ty
-                run_len += 1
-            else:
-                if run_len > best_run:
-                    best_run, best_col, best_y = run_len, tx, run_start
-                run_len = 0
-        if run_len > best_run:
-            best_run, best_col, best_y = run_len, tx, run_start
-
-    if best_run < 3:  # 최소 3개 아이콘
+    if not runs:
         return None
 
-    # 인접 열 확인 (2열 버프 바)
-    x_start, x_end = best_col, best_col
-    if best_col > 0:
-        adj = is_icon[best_y:best_y + best_run, best_col - 1]
-        if adj.sum() >= best_run * 0.5:
-            x_start = best_col - 1
-    if best_col + 1 < nx:
-        adj = is_icon[best_y:best_y + best_run, best_col + 1]
-        if adj.sum() >= best_run * 0.5:
-            x_end = best_col + 1
+    # 가까운 구간 병합 (아이콘 간 갭은 짧으므로)
+    merged = [list(runs[0])]
+    for s, e in runs[1:]:
+        if s - merged[-1][1] <= bs:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
 
-    # 타일 좌표 → 픽셀 좌표 (러프)
-    roi_x = w - scan_w + x_start * bs
-    roi_y = best_y * bs
-    roi_w = (x_end - x_start + 1) * bs
-    roi_h = best_run * bs
+    # 가장 긴 구간 선택
+    best_run = max(merged, key=lambda b: b[1] - b[0])
+    y_start, y_end = best_run
 
-    # 세로가 가로의 2배 이상이어야 버프 바 (미니맵 등 제외)
-    if roi_h < roi_w * 2:
+    if (y_end - y_start) < bs * 2:
         return None
 
-    # 정밀 보정: 러프 ROI 내부에서 실제 컨텐츠 경계 재탐색
+    roi_x = w - scan_w + best_x
+    roi_y = y_start
+    roi_w = best_strip_w
+    roi_h = y_end - y_start
+
+    # 세로가 가로보다 길어야 버프 바 (미니맵 등 제외)
+    if roi_h < roi_w * 1.5:
+        return None
+
+    # 정밀 보정: ROI 내부에서 실제 컨텐츠 경계 재탐색
     rough = bgr_img[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
     g = cv2.cvtColor(rough, cv2.COLOR_BGR2GRAY)
     row_blocks = _find_content_blocks(g.std(axis=1), min_length=8)
