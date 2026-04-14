@@ -669,17 +669,35 @@ class Watcher:
                     self.status.config(text="⚠ ROI 범위 초과", fg="orange")
                 else:
                     roi_img = full[ry:ry + rh, rx:rx + rw]
-                    current = auto_split_icons(roi_img)
-                    current_sigs = [icon_signature(img) for _c, _r, img in current]
+                    h_roi, w_roi = roi_img.shape[:2]
+                    icon_size = self.saved[0][1].shape[0] if self.saved \
+                        else FALLBACK_ICON_SIZE
 
+                    # --- 슬라이딩 윈도우 매칭 ---
+                    # 격자 분할 대신 ROI 전체를 슬라이딩하며 각 템플릿 탐색
+                    # → 아이콘 순서/위치가 바뀌어도 정확히 매칭
                     missing_detail = []
-                    for name, img, sig in self.saved:
-                        if not current_sigs:
-                            missing_detail.append((name, img))
-                            continue
-                        best = max(sig_score(sig, c) for c in current_sigs)
-                        if best < MATCH_THRESHOLD:
-                            missing_detail.append((name, img))
+                    step = max(2, icon_size // 6)
+
+                    if h_roi < icon_size or w_roi < icon_size:
+                        missing_detail = [(n, i) for n, i, _ in self.saved]
+                    else:
+                        for name, img, sig in self.saved:
+                            found = False
+                            for y in range(0, h_roi - icon_size + 1, step):
+                                for x in range(0, w_roi - icon_size + 1, step):
+                                    patch = roi_img[y:y + icon_size,
+                                                    x:x + icon_size]
+                                    ps = icon_signature(patch)
+                                    if sig_score(sig, ps) >= MATCH_THRESHOLD:
+                                        found = True
+                                        break
+                                if found:
+                                    break
+                            if not found:
+                                missing_detail.append((name, img))
+
+                    present_count = len(self.saved) - len(missing_detail)
                     missing_set = frozenset(n for n, _ in missing_detail)
 
                     # 디바운싱
@@ -692,7 +710,7 @@ class Watcher:
                     if self.stable_count >= CONFIRM_TICKS:
                         if missing_set != self.current_missing:
                             self.current_missing = missing_set
-                            self.update_display(missing_detail, len(current))
+                            self.update_display(missing_detail, present_count)
                         else:
                             self.update_timestamp()
                     else:
