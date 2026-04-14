@@ -422,84 +422,109 @@ def _estimate_grid_params(std_signal, expected_size=None, min_length=8):
 
 
 def auto_split_icons(roi_img, empty_std_threshold=15.0):
-    """아이콘이 정사각형이라고 가정하고 ROI를 격자로 분할.
-    1) 세로 분석으로 아이콘 크기 + 세로 피치 추정
-    2) 개별 행 스트립의 가로 프로파일로 열 위치 결정 (2열 정확도 개선)
-    3) 편차 낮은 셀(빈 칸)은 제외
+    """ROI 안에서 개별 버프 아이콘을 감지.
+
+    격자 분할 대신 슬라이딩 윈도우 + 비최대 억제(NMS)로 개별 아이콘
+    위치를 찾는다. 아이콘 순서나 간격이 달라도 정확하게 감지.
+
+    점수 기준: 내부 변동(0.3) + 색 채도(0.4) + 엣지 밀도(0.3)
+    게임 배경 텍스처는 채도가 낮고 엣지가 불규칙해서 걸러진다.
 
     반환: [(col, row, bgr_img), ...]"""
     if roi_img is None or roi_img.size == 0:
         return []
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
     H, W = gray.shape
 
-    # 세로(행) 분석으로 아이콘 크기 결정
+    # 아이콘 크기 추정 (세로 컨텐츠 블록 길이)
     row_std = gray.std(axis=1)
-    cell_h, step_y, y_off = _estimate_grid_params(row_std)
-
-    size = cell_h or FALLBACK_ICON_SIZE
-    if size < 12:
-        size = FALLBACK_ICON_SIZE
-    step_y = step_y or size
-
-    if H < size or W < size:
-        return []
-
-    rows = 1 + max(0, (H - y_off - size) // step_y) if step_y > 0 else 1
-
-    # --- 가로 분석: 상위 행 스트립의 가로 프로파일 평균 사용 ---
-    # 전체 ROI 높이의 col_std 대신, 개별 행 스트립을 분석하면
-    # 2열 사이 작은 간격이 훨씬 명확하게 보인다.
-    row_scores = []
-    for r in range(rows):
-        y1 = y_off + r * step_y
-        if y1 + size > H:
-            continue
-        strip = gray[y1:y1 + size, :]
-        row_scores.append((strip.std(), r))
-    row_scores.sort(reverse=True)
-
-    n_samples = min(3, len(row_scores))
-    if n_samples == 0:
-        return []
-
-    avg_col_profile = np.zeros(W, dtype=np.float64)
-    for _, r in row_scores[:n_samples]:
-        y1 = y_off + r * step_y
-        strip = gray[y1:y1 + size, :]
-        avg_col_profile += strip.std(axis=0)
-    avg_col_profile /= n_samples
-
-    _cw, step_x, x_off = _estimate_grid_params(avg_col_profile,
-                                                 expected_size=size)
-
-    # 폴백: 가로 분석 실패 시 ROI 폭과 아이콘 크기로 열 수 추정
-    if step_x is None or step_x < size:
-        n_cols = max(1, round(W / size))
-        if n_cols == 1:
-            step_x = size
-            x_off = max(0, (W - size) // 2)
-        else:
-            step_x = (W - size) // (n_cols - 1)
-            x_off = 0
+    blocks = _find_content_blocks(row_std, min_length=8)
+    if blocks:
+        bs = int(np.median([l for _, l in blocks]))
+        if bs < 12:
+            bs = FALLBACK_ICON_SIZE
     else:
-        step_x = step_x or size
+        bs = FALLBACK_ICON_SIZE
 
-    cols = 1 + max(0, (W - x_off - size) // step_x) if step_x > 0 else 1
+    if H < bs or W < bs:
+        return []
+
+    # --- Phase 1: 슬라이딩 윈도우로 아이콘 후보 점수화 ---
+    step = max(2, bs // 6)
+    candidates = []
+
+    for y in range(0, H - bs + 1, step):
+        for x in range(0, W - bs + 1, step):
+            pg = gray[y:y + bs, x:x + bs]
+            var = pg.std()
+            if var < empty_std_threshold:
+                continue
+
+            sat = float(hsv[y:y + bs, x:x + bs, 1].mean())
+            edges = cv2.Canny(pg, 40, 120)
+            edge_r = float(edges.sum()) / (bs * bs * 255)
+
+            score = (min(var / 50, 1) * 0.3
+                     + min(sat / 60, 1) * 0.4
+                     + min(edge_r / 0.12, 1) * 0.3)
+
+            if score > 0.3:
+                candidates.append((x, y, score))
+
+    if not candidates:
+        return []
+
+    # --- Phase 2: 비최대 억제 (NMS) ---
+    candidates.sort(key=lambda c: -c[2])
+    selected = []
+    for x, y, sc in candidates:
+        if not any(abs(x - sx) < bs * 0.6 and abs(y - sy) < bs * 0.6
+                   for sx, sy, _ in selected):
+            selected.append((x, y, sc))
+
+    if not selected:
+        return []
+
+    # --- Phase 3: 위치 미세 보정 (±step 범위에서 최고 점수 탐색) ---
+    refined = []
+    for x, y, sc in selected:
+        bx, by, bsc = x, y, sc
+        for dy in range(-step, step + 1):
+            for dx in range(-step, step + 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx <= W - bs and 0 <= ny <= H - bs:
+                    pg = gray[ny:ny + bs, nx:nx + bs]
+                    var = pg.std()
+                    if var < empty_std_threshold:
+                        continue
+                    sat = float(hsv[ny:ny + bs, nx:nx + bs, 1].mean())
+                    edges = cv2.Canny(pg, 40, 120)
+                    er = float(edges.sum()) / (bs * bs * 255)
+                    s2 = (min(var / 50, 1) * 0.3
+                          + min(sat / 60, 1) * 0.4
+                          + min(er / 0.12, 1) * 0.3)
+                    if s2 > bsc:
+                        bx, by, bsc = nx, ny, s2
+        refined.append((bx, by, bsc))
+    selected = refined
+
+    # --- Phase 4: 열/행 할당 ---
+    selected.sort(key=lambda s: s[0])
+    columns = [[selected[0]]]
+    for item in selected[1:]:
+        if abs(item[0] - columns[-1][-1][0]) < bs * 0.5:
+            columns[-1].append(item)
+        else:
+            columns.append([item])
 
     icons = []
-    for r in range(rows):
-        for c in range(cols):
-            y1 = y_off + r * step_y
-            x1 = x_off + c * step_x
-            y2 = y1 + size
-            x2 = x1 + size
-            if y2 > H or x2 > W or y1 < 0 or x1 < 0:
-                continue
-            cell = roi_img[y1:y2, x1:x2]
-            if cell.std() < empty_std_threshold:
-                continue  # 빈 칸
-            icons.append((c, r, cell))
+    for c_idx, col in enumerate(columns):
+        col.sort(key=lambda item: item[1])
+        for r_idx, (x, y, _) in enumerate(col):
+            icon = roi_img[y:y + bs, x:x + bs]
+            icons.append((c_idx, r_idx, icon))
+
     return icons
 
 
@@ -920,18 +945,52 @@ def main():
                 status.config(text="ROI 수동 지정됨", fg="blue")
 
     def do_save():
-        if not (state["window_title"] and state["roi_rel"]):
-            messagebox.showwarning("안내", "창과 ROI를 먼저 지정하세요.")
-            return
+        # --- 원클릭 흐름: 창 찾기 → ROI 감지 → 아이콘 분리 전부 자동 ---
+
+        # 1) 창 자동 탐색
+        if not state["window_title"]:
+            t = auto_find_game_window()
+            if t:
+                state["window_title"] = t
+                save_config(state); refresh_info()
+            else:
+                t = pick_window_dialog(root)
+                if not t:
+                    return
+                state["window_title"] = t
+                save_config(state); refresh_info()
+
         rect = get_window_rect(state["window_title"])
         if rect is None:
             messagebox.showerror("에러", "창을 찾지 못했어요.")
             return
+
+        full = grab_rect(rect)
+
+        # 2) ROI 자동 감지
+        if not state["roi_rel"]:
+            roi = auto_detect_buff_roi(full)
+            if roi:
+                state["roi_rel"] = roi
+                save_config(state); refresh_info()
+            else:
+                # ROI 자동 실패 → 수동 드래그
+                roi = pick_roi_on_image(full, root)
+                if not roi:
+                    return
+                state["roi_rel"] = roi
+                save_config(state); refresh_info()
+
+        # 3) 템플릿 저장 (auto_split_icons가 NMS 기반으로 개별 감지)
         n, saved = save_templates(rect, state["roi_rel"])
         if n == -1:
             messagebox.showerror("에러", "ROI가 창 밖으로 나갔습니다.")
         elif n == 0:
-            messagebox.showerror("에러", "아이콘 감지 실패. ROI를 다시 잡아보세요.")
+            messagebox.showerror("에러",
+                                 "아이콘 감지 실패.\n"
+                                 "ROI를 수동으로 다시 선택하세요.")
+            state["roi_rel"] = None
+            save_config(state); refresh_info()
         else:
             final = review_dialog(root, saved)
             if final == -1:
