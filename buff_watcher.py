@@ -4,7 +4,7 @@ Buff Watcher v3 — 자동 아이콘 감지 + 강건한 매칭
 - 창 선택 → ROI 지정 (한 번)
 - ROI 내부에서 아이콘을 '자동 분리' (행 분산 기반)
 - 매칭은 HSV 색상 히스토그램 — 쿨타임 어둠/배경 변화에 강건
-- 빠진 버프는 메인 창 안에 24x24 썸네일로 인라인 표시
+- 빠진 버프는 메인 창 안에 32x32 썸네일로 인라인 표시
 - 2틱 연속 missing이어야 확정 (깜빡임 방지)
 
 설치: pip install mss opencv-python numpy pillow pygetwindow
@@ -29,11 +29,11 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 CONFIG_DIR.mkdir(exist_ok=True)
 ICONS_DIR.mkdir(exist_ok=True)
 
-FALLBACK_ICON_SIZE = 24
+FALLBACK_ICON_SIZE = 32
 MATCH_THRESHOLD = 0.70
 WATCH_INTERVAL = 0.5
 CONFIRM_TICKS = 2
-THUMB_SIZE = 24
+THUMB_SIZE = 32
 AUTO_GAME_KEYWORDS = ["ragnarok"]  # 자동 탐색할 게임 창 키워드
 
 
@@ -112,7 +112,7 @@ def auto_detect_buff_roi(bgr_img):
     right = bgr_img[:, w - scan_w:]
     gray = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
 
-    bs = FALLBACK_ICON_SIZE  # 24
+    bs = FALLBACK_ICON_SIZE  # 32
     best_x, best_score, best_strip_w = -1, 0.0, bs
 
     # 1열(bs) 및 2열(bs*2+gap) 스트립을 슬라이딩하며 주기 패턴 탐색
@@ -328,7 +328,7 @@ def pick_roi_on_image(bgr_img, parent):
     return result["roi"]
 
 
-# --- 자동 아이콘 분리 (격자 방식) --------------------------------------------
+# --- 자동 아이콘 분리 (흰색 테두리 + NMS) ------------------------------------
 def _find_content_blocks(std_signal, min_length=8):
     """1D 표준편차 신호에서 컨텐츠 구간(시작, 길이)을 찾는다."""
     if std_signal.max() == 0:
@@ -421,77 +421,127 @@ def _estimate_grid_params(std_signal, expected_size=None, min_length=8):
     return cell_size, step, offset
 
 
+def _assign_grid(positions, roi_img, bs):
+    """감지된 위치를 열/행으로 분류하고 아이콘 이미지 추출."""
+    positions.sort(key=lambda s: s[0])
+    columns = [[positions[0]]]
+    for item in positions[1:]:
+        if abs(item[0] - columns[-1][-1][0]) < bs * 0.5:
+            columns[-1].append(item)
+        else:
+            columns.append([item])
+
+    icons = []
+    for c_idx, col in enumerate(columns):
+        col.sort(key=lambda item: item[1])
+        for r_idx, (x, y, _) in enumerate(col):
+            icon = roi_img[y:y + bs, x:x + bs]
+            icons.append((c_idx, r_idx, icon))
+    return icons
+
+
 def auto_split_icons(roi_img, empty_std_threshold=15.0):
-    """ROI 안에서 개별 버프 아이콘을 감지.
+    """ROI 안에서 버프 아이콘을 개별 감지.
 
-    격자 분할 대신 슬라이딩 윈도우 + 비최대 억제(NMS)로 개별 아이콘
-    위치를 찾는다. 아이콘 순서나 간격이 달라도 정확하게 감지.
-
-    점수 기준: 내부 변동(0.3) + 색 채도(0.4) + 엣지 밀도(0.3)
-    게임 배경 텍스처는 채도가 낮고 엣지가 불규칙해서 걸러진다.
+    방법 1 — 흰색 테두리(32×32) 박스를 앵커로 정확한 위치 결정.
+    방법 2 (폴백) — 슬라이딩 윈도우 + NMS 스코어링.
 
     반환: [(col, row, bgr_img), ...]"""
     if roi_img is None or roi_img.size == 0:
         return []
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
     H, W = gray.shape
-
-    # 아이콘 크기 추정 (세로 컨텐츠 블록 길이)
-    row_std = gray.std(axis=1)
-    blocks = _find_content_blocks(row_std, min_length=8)
-    if blocks:
-        bs = int(np.median([l for _, l in blocks]))
-        if bs < 12:
-            bs = FALLBACK_ICON_SIZE
-    else:
-        bs = FALLBACK_ICON_SIZE
+    bs = FALLBACK_ICON_SIZE  # 32
 
     if H < bs or W < bs:
         return []
 
-    # --- Phase 1: 슬라이딩 윈도우로 아이콘 후보 점수화 ---
-    step = max(2, bs // 6)
-    candidates = []
+    # ===== 방법 1: 흰색 테두리 감지 =====
+    # 32×32 박스의 외곽 1px 링을 마스크로 사용
+    border_mask = np.zeros((bs, bs), dtype=bool)
+    border_mask[0, :] = True    # 상단
+    border_mask[-1, :] = True   # 하단
+    border_mask[:, 0] = True    # 좌측
+    border_mask[:, -1] = True   # 우측
+    n_border = int(border_mask.sum())
+
+    bright_thresh = 180
+    step = max(2, bs // 8)  # 4px
+    border_cands = []
 
     for y in range(0, H - bs + 1, step):
         for x in range(0, W - bs + 1, step):
+            patch = gray[y:y + bs, x:x + bs]
+            ratio = float((patch[border_mask] > bright_thresh).sum()) / n_border
+            if ratio > 0.5:
+                inner = patch[2:-2, 2:-2]
+                if inner.std() > empty_std_threshold:
+                    border_cands.append((x, y, ratio))
+
+    if len(border_cands) >= 3:
+        # NMS
+        border_cands.sort(key=lambda c: -c[2])
+        sel = []
+        for x, y, sc in border_cands:
+            if not any(abs(x - sx) < bs * 0.6 and abs(y - sy) < bs * 0.6
+                       for sx, sy, _ in sel):
+                sel.append((x, y, sc))
+
+        # 미세 보정 ±3px (테두리 점수 최대화)
+        ref = []
+        for x, y, sc in sel:
+            bx, by, bsc = x, y, sc
+            for dy in range(-3, 4):
+                for dx in range(-3, 4):
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx <= W - bs and 0 <= ny <= H - bs:
+                        p = gray[ny:ny + bs, nx:nx + bs]
+                        r = float((p[border_mask] > bright_thresh).sum()) / n_border
+                        if r > bsc:
+                            bx, by, bsc = nx, ny, r
+            ref.append((bx, by, bsc))
+
+        if len(ref) >= 3:
+            return _assign_grid(ref, roi_img, bs)
+
+    # ===== 방법 2: NMS 스코어링 (폴백) =====
+    hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+    step2 = max(2, bs // 6)
+    nms_cands = []
+
+    for y in range(0, H - bs + 1, step2):
+        for x in range(0, W - bs + 1, step2):
             pg = gray[y:y + bs, x:x + bs]
             var = pg.std()
             if var < empty_std_threshold:
                 continue
-
             sat = float(hsv[y:y + bs, x:x + bs, 1].mean())
             edges = cv2.Canny(pg, 40, 120)
             edge_r = float(edges.sum()) / (bs * bs * 255)
-
             score = (min(var / 50, 1) * 0.3
                      + min(sat / 60, 1) * 0.4
                      + min(edge_r / 0.12, 1) * 0.3)
-
             if score > 0.3:
-                candidates.append((x, y, score))
+                nms_cands.append((x, y, score))
 
-    if not candidates:
+    if not nms_cands:
         return []
 
-    # --- Phase 2: 비최대 억제 (NMS) ---
-    candidates.sort(key=lambda c: -c[2])
-    selected = []
-    for x, y, sc in candidates:
+    nms_cands.sort(key=lambda c: -c[2])
+    sel2 = []
+    for x, y, sc in nms_cands:
         if not any(abs(x - sx) < bs * 0.6 and abs(y - sy) < bs * 0.6
-                   for sx, sy, _ in selected):
-            selected.append((x, y, sc))
+                   for sx, sy, _ in sel2):
+            sel2.append((x, y, sc))
 
-    if not selected:
+    if not sel2:
         return []
 
-    # --- Phase 3: 위치 미세 보정 (±step 범위에서 최고 점수 탐색) ---
-    refined = []
-    for x, y, sc in selected:
+    ref2 = []
+    for x, y, sc in sel2:
         bx, by, bsc = x, y, sc
-        for dy in range(-step, step + 1):
-            for dx in range(-step, step + 1):
+        for dy in range(-step2, step2 + 1):
+            for dx in range(-step2, step2 + 1):
                 nx, ny = x + dx, y + dy
                 if 0 <= nx <= W - bs and 0 <= ny <= H - bs:
                     pg = gray[ny:ny + bs, nx:nx + bs]
@@ -506,26 +556,9 @@ def auto_split_icons(roi_img, empty_std_threshold=15.0):
                           + min(er / 0.12, 1) * 0.3)
                     if s2 > bsc:
                         bx, by, bsc = nx, ny, s2
-        refined.append((bx, by, bsc))
-    selected = refined
+        ref2.append((bx, by, bsc))
 
-    # --- Phase 4: 열/행 할당 ---
-    selected.sort(key=lambda s: s[0])
-    columns = [[selected[0]]]
-    for item in selected[1:]:
-        if abs(item[0] - columns[-1][-1][0]) < bs * 0.5:
-            columns[-1].append(item)
-        else:
-            columns.append([item])
-
-    icons = []
-    for c_idx, col in enumerate(columns):
-        col.sort(key=lambda item: item[1])
-        for r_idx, (x, y, _) in enumerate(col):
-            icon = roi_img[y:y + bs, x:x + bs]
-            icons.append((c_idx, r_idx, icon))
-
-    return icons
+    return _assign_grid(ref2, roi_img, bs)
 
 
 # --- 강건한 매칭: HSV 히스토그램 --------------------------------------------
@@ -879,7 +912,7 @@ def main():
                              font=("맑은 고딕", 10), fg="gray", bg="#f5f5f5")
     missing_count.pack(side="left", padx=4)
 
-    missing_frame = tk.Frame(root, bg="#2b2b2b", height=34)
+    missing_frame = tk.Frame(root, bg="#2b2b2b", height=42)
     missing_frame.pack(fill="x", padx=20, pady=(0, 10))
     missing_frame.pack_propagate(False)
 
