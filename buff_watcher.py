@@ -191,37 +191,60 @@ def pick_roi_on_image(bgr_img, parent):
 
 
 # --- 자동 아이콘 분리 (격자 방식) --------------------------------------------
-def _estimate_icon_size(gray):
-    """행 단위 컨텐츠 구간 길이들의 중앙값으로 아이콘 높이 추정."""
-    H = gray.shape[0]
-    row_std = gray.std(axis=1)
-    if row_std.max() == 0:
-        return None
-    norm = row_std / row_std.max()
+def _find_content_blocks(std_signal, min_length=8):
+    """1D 표준편차 신호에서 컨텐츠 구간(시작, 길이)을 찾는다."""
+    if std_signal.max() == 0:
+        return []
+    norm = std_signal / std_signal.max()
     threshold = max(0.15, norm.mean() * 0.4)
-    is_c = norm > threshold
-    lengths = []
-    in_blk = False; start = 0
-    for y in range(H):
-        if is_c[y] and not in_blk:
-            start = y; in_blk = True
-        elif not is_c[y] and in_blk:
-            if y - start >= 8:
-                lengths.append(y - start)
-            in_blk = False
-    if in_blk and H - start >= 8:
-        lengths.append(H - start)
+    is_content = norm > threshold
 
-    if not lengths:
-        return None
-    med = int(np.median(lengths))
-    return med if med >= 12 else None
+    blocks = []
+    in_blk = False
+    start = 0
+    for i in range(len(std_signal)):
+        if is_content[i] and not in_blk:
+            start = i
+            in_blk = True
+        elif not is_content[i] and in_blk:
+            if i - start >= min_length:
+                blocks.append((start, i - start))
+            in_blk = False
+    if in_blk and len(std_signal) - start >= min_length:
+        blocks.append((start, len(std_signal) - start))
+    return blocks
+
+
+def _estimate_grid_params(std_signal, min_length=8):
+    """컨텐츠 구간에서 셀 크기, 스텝(피치), 시작 오프셋을 추정.
+
+    반환: (cell_size, step, offset) 또는 (None, None, 0)
+    - cell_size: 아이콘 픽셀 크기
+    - step: 아이콘 시작점 간 거리 (아이콘 + 간격)
+    - offset: 첫 번째 아이콘 시작 위치
+    """
+    blocks = _find_content_blocks(std_signal, min_length)
+    if not blocks:
+        return None, None, 0
+
+    cell_size = int(np.median([length for _, length in blocks]))
+    offset = blocks[0][0]
+
+    if len(blocks) >= 2:
+        pitches = [blocks[i + 1][0] - blocks[i][0]
+                   for i in range(len(blocks) - 1)]
+        step = int(np.median(pitches))
+        step = max(step, cell_size)  # step은 최소한 cell_size 이상
+    else:
+        step = cell_size
+
+    return cell_size, step, offset
 
 
 def auto_split_icons(roi_img, empty_std_threshold=15.0):
     """아이콘이 정사각형이라고 가정하고 ROI를 격자로 분할.
-    1) 행 분석으로 아이콘 한 변 추정
-    2) 그 크기로 격자 생성
+    1) 행/열 분석으로 아이콘 크기 + 간격(피치) 추정
+    2) 피치 간격으로 격자 생성 (간격 고려)
     3) 편차 낮은 셀(빈 칸)은 제외
 
     반환: [(col, row, bgr_img), ...]"""
@@ -230,24 +253,35 @@ def auto_split_icons(roi_img, empty_std_threshold=15.0):
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
     H, W = gray.shape
 
-    size = _estimate_icon_size(gray) or FALLBACK_ICON_SIZE
+    # 세로(행) / 가로(열) 각각 분석
+    row_std = gray.std(axis=1)
+    col_std = gray.std(axis=0)
+
+    cell_h, step_y, y_off = _estimate_grid_params(row_std)
+    cell_w, step_x, x_off = _estimate_grid_params(col_std)
+
+    # 아이콘은 정사각형 → 세로 기준 크기 우선 사용
+    size = cell_h or cell_w or FALLBACK_ICON_SIZE
+    if size < 12:
+        size = FALLBACK_ICON_SIZE
+
+    step_y = step_y or size
+    step_x = step_x or size
+
     # ROI가 너무 작으면 포기
     if H < size or W < size:
         return []
 
-    cols = max(1, W // size)
-    rows = max(1, H // size)
-
-    # 가운데 정렬: 남는 픽셀이 양쪽에 균등 분배되도록 오프셋
-    x_off = (W - cols * size) // 2
-    y_off = (H - rows * size) // 2
+    # 그리드 셀 수 계산 (첫 아이콘 시작 + 피치 * n이 ROI 안에 들어오는 수)
+    rows = 1 + max(0, (H - y_off - size) // step_y) if step_y > 0 else 1
+    cols = 1 + max(0, (W - x_off - size) // step_x) if step_x > 0 else 1
 
     icons = []
     for r in range(rows):
         for c in range(cols):
-            y1 = y_off + r * size
+            y1 = y_off + r * step_y
+            x1 = x_off + c * step_x
             y2 = y1 + size
-            x1 = x_off + c * size
             x2 = x1 + size
             if y2 > H or x2 > W or y1 < 0 or x1 < 0:
                 continue
