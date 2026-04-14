@@ -440,9 +440,144 @@ def _assign_grid(positions, roi_img, bs):
     return icons
 
 
+def _detect_pitch_autocorr(signal, min_lag, max_lag):
+    """1D 신호의 자기상관으로 주기(피치) 감지.
+
+    반환: 감지된 피치 (정수) 또는 None
+    """
+    signal = np.asarray(signal, dtype=np.float64)
+    centered = signal - signal.mean()
+    norm_val = np.sqrt(np.sum(centered ** 2))
+    if norm_val < 1e-6:
+        return None
+    normed = centered / norm_val
+
+    best_lag, best_corr = None, 0.2
+    for lag in range(max(1, min_lag), min(max_lag + 1, len(normed) // 2)):
+        n = len(normed) - lag
+        if n < lag:
+            continue
+        corr = float(np.dot(normed[:n], normed[lag:lag + n]))
+        if corr > best_corr:
+            best_corr = corr
+            best_lag = lag
+    return best_lag
+
+
+def _find_grid_offset(bright_frac, pitch, cell_size, length):
+    """격자 시작 오프셋을 결정.
+
+    각 격자 셀의 첫/마지막 행(또는 열)이 밝은(테두리) 위치에
+    오도록 오프셋을 최적화한다.
+
+    반환: (offset, score)
+    """
+    best_off, best_score = 0, -1.0
+    search_range = min(pitch, max(1, length - cell_size + 1))
+    for off in range(search_range):
+        score = 0.0
+        count = 0
+        pos = off
+        while pos + cell_size <= length:
+            score += bright_frac[pos]
+            score += bright_frac[pos + cell_size - 1]
+            count += 2
+            pos += pitch
+        if count >= 2:
+            avg = score / count
+            if avg > best_score:
+                best_score = avg
+                best_off = off
+    return best_off, best_score
+
+
+def _grid_split(roi_img, gray, bs, empty_std_threshold):
+    """격자 구조 감지 기반 아이콘 분리.
+
+    1) 세로/가로 std 프로파일의 자기상관으로 피치(아이콘 간격) 감지
+    2) 흰색 테두리 밝기를 기반으로 격자 시작 오프셋 결정
+    3) 피치 미세 보정 (±2 px)
+    4) 격자 위치에서 유효한 아이콘만 추출
+
+    반환: [(col, row, bgr_img), ...]
+    """
+    H, W = gray.shape
+
+    # --- 1) 피치 감지 (자기상관) ---
+    row_std = gray.std(axis=1)
+    y_pitch = _detect_pitch_autocorr(row_std, bs - 10, bs + 12)
+    if y_pitch is None:
+        y_pitch = bs
+
+    if W >= bs * 1.5:
+        col_std = gray.std(axis=0)
+        x_pitch = _detect_pitch_autocorr(col_std, bs - 10, bs + 12)
+        if x_pitch is None:
+            x_pitch = bs
+    else:
+        x_pitch = bs
+
+    # 추출 크기 (피치 이하로 — 겹침 방지)
+    cell_h = min(bs, y_pitch)
+    cell_w = min(bs, x_pitch)
+
+    # --- 2) 밝은 테두리 기반 오프셋 ---
+    bright = (gray > 180).astype(np.float64)
+    row_bright = bright.mean(axis=1)
+    col_bright = bright.mean(axis=0)
+
+    y_off, y_score = _find_grid_offset(row_bright, y_pitch, cell_h, H)
+    x_off, x_score = _find_grid_offset(col_bright, x_pitch, cell_w, W)
+
+    if y_score < 0.15:
+        return []
+
+    # --- 3) 피치 미세 보정 (±2) ---
+    for dp in range(-2, 3):
+        tp = y_pitch + dp
+        if tp < bs - 10 or tp > bs + 12 or tp < 12:
+            continue
+        ch = min(bs, tp)
+        off, sc = _find_grid_offset(row_bright, tp, ch, H)
+        if sc > y_score:
+            y_pitch, y_off, y_score, cell_h = tp, off, sc, ch
+
+    for dp in range(-2, 3):
+        tp = x_pitch + dp
+        if tp < bs - 10 or tp > bs + 12 or tp < 12:
+            continue
+        cw = min(bs, tp)
+        off, sc = _find_grid_offset(col_bright, tp, cw, W)
+        if sc > x_score:
+            x_pitch, x_off, x_score, cell_w = tp, off, sc, cw
+
+    # --- 4) 격자에서 아이콘 추출 ---
+    margin = min(2, cell_h // 4, cell_w // 4)
+
+    icons = []
+    col_idx = 0
+    x = x_off
+    while x + cell_w <= W:
+        row_idx = 0
+        y = y_off
+        while y + cell_h <= H:
+            patch = gray[y:y + cell_h, x:x + cell_w]
+            inner = patch[margin:-margin, margin:-margin] if margin > 0 else patch
+            if inner.std() > empty_std_threshold:
+                icon = roi_img[y:y + cell_h, x:x + cell_w]
+                icons.append((col_idx, row_idx, icon))
+            row_idx += 1
+            y += y_pitch
+        col_idx += 1
+        x += x_pitch
+
+    return icons
+
+
 def auto_split_icons(roi_img, empty_std_threshold=15.0):
     """ROI 안에서 버프 아이콘을 개별 감지.
 
+    방법 0 — 격자 기반: 자기상관으로 피치 감지 + 테두리 오프셋 정렬.
     방법 1 — 흰색 테두리(32×32) 박스를 앵커로 정확한 위치 결정.
     방법 2 (폴백) — 슬라이딩 윈도우 + NMS 스코어링.
 
@@ -455,6 +590,11 @@ def auto_split_icons(roi_img, empty_std_threshold=15.0):
 
     if H < bs or W < bs:
         return []
+
+    # ===== 방법 0: 격자 기반 (자기상관 + 테두리 오프셋) =====
+    grid_icons = _grid_split(roi_img, gray, bs, empty_std_threshold)
+    if len(grid_icons) >= 3:
+        return grid_icons
 
     # ===== 방법 1: 흰색 테두리 감지 =====
     # 32×32 박스의 외곽 1px 링을 마스크로 사용
