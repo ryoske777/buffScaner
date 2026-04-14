@@ -215,28 +215,70 @@ def _find_content_blocks(std_signal, min_length=8):
     return blocks
 
 
-def _estimate_grid_params(std_signal, min_length=8):
+def _estimate_grid_params(std_signal, expected_size=None, min_length=8):
     """컨텐츠 구간에서 셀 크기, 스텝(피치), 시작 오프셋을 추정.
 
     반환: (cell_size, step, offset) 또는 (None, None, 0)
     - cell_size: 아이콘 픽셀 크기
     - step: 아이콘 시작점 간 거리 (아이콘 + 간격)
     - offset: 첫 번째 아이콘 시작 위치
+
+    expected_size: 이미 알려진 아이콘 크기. 가로 분석 시 세로에서 구한
+                   크기를 넘기면 합쳐진 블록을 세분화할 수 있다.
     """
     blocks = _find_content_blocks(std_signal, min_length)
     if not blocks:
         return None, None, 0
 
     cell_size = int(np.median([length for _, length in blocks]))
-    offset = blocks[0][0]
 
-    if len(blocks) >= 2:
-        pitches = [blocks[i + 1][0] - blocks[i][0]
-                   for i in range(len(blocks) - 1)]
+    # 이미 알려진 크기보다 블록이 훨씬 크면 → 간격이 좁아 합쳐진 것, 세분화
+    if expected_size and expected_size >= 12 and cell_size > expected_size * 1.3:
+        refined = []
+        for bstart, blength in blocks:
+            n = max(1, round(blength / expected_size))
+            if n == 1:
+                refined.append((bstart, blength))
+            else:
+                # 블록 내부 std 골(valley)을 찾아 정확한 분리점 결정
+                seg = std_signal[bstart:bstart + blength]
+                sub_pitch = blength / n
+                splits = [0]
+                for k in range(1, n):
+                    approx = int(round(k * sub_pitch))
+                    lo = max(0, approx - int(sub_pitch * 0.25))
+                    hi = min(blength, approx + int(sub_pitch * 0.25))
+                    if lo < hi and hi <= len(seg):
+                        valley = lo + int(np.argmin(seg[lo:hi]))
+                        splits.append(valley)
+                    else:
+                        splits.append(approx)
+                splits.append(blength)
+                for k in range(len(splits) - 1):
+                    s = bstart + splits[k]
+                    l = splits[k + 1] - splits[k]
+                    if l >= min_length:
+                        refined.append((s, l))
+        blocks = refined
+        cell_size = expected_size
+
+    use_size = expected_size if expected_size and expected_size >= 12 else cell_size
+
+    # 블록 중심 기반으로 아이콘 시작 위치 계산 (경계 감지 오차 보정)
+    starts = []
+    for bstart, blength in blocks:
+        center = bstart + blength // 2
+        icon_start = center - use_size // 2
+        starts.append(max(0, icon_start))
+
+    offset = starts[0] if starts else 0
+
+    if len(starts) >= 2:
+        pitches = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
         step = int(np.median(pitches))
-        step = max(step, cell_size)  # step은 최소한 cell_size 이상
+        step = max(step, use_size)
     else:
-        step = cell_size
+        step = use_size
 
     return cell_size, step, offset
 
@@ -253,17 +295,18 @@ def auto_split_icons(roi_img, empty_std_threshold=15.0):
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
     H, W = gray.shape
 
-    # 세로(행) / 가로(열) 각각 분석
+    # 세로(행) 분석으로 아이콘 크기 결정
     row_std = gray.std(axis=1)
-    col_std = gray.std(axis=0)
-
     cell_h, step_y, y_off = _estimate_grid_params(row_std)
-    cell_w, step_x, x_off = _estimate_grid_params(col_std)
 
     # 아이콘은 정사각형 → 세로 기준 크기 우선 사용
-    size = cell_h or cell_w or FALLBACK_ICON_SIZE
+    size = cell_h or FALLBACK_ICON_SIZE
     if size < 12:
         size = FALLBACK_ICON_SIZE
+
+    # 가로(열) 분석 — expected_size 전달하여 합쳐진 블록 세분화
+    col_std = gray.std(axis=0)
+    _cw, step_x, x_off = _estimate_grid_params(col_std, expected_size=size)
 
     step_y = step_y or size
     step_x = step_x or size
