@@ -34,6 +34,7 @@ MATCH_THRESHOLD = 0.70
 WATCH_INTERVAL = 1.5
 CONFIRM_TICKS = 2
 THUMB_SIZE = 24
+AUTO_GAME_KEYWORDS = ["ragnarok"]  # 자동 탐색할 게임 창 키워드
 
 
 # --- 창 헬퍼 -----------------------------------------------------------------
@@ -75,6 +76,119 @@ def grab_rect(rect):
     with mss.mss() as sct:
         shot = sct.grab({"left": x, "top": y, "width": w, "height": h})
     return np.array(shot)[:, :, :3]
+
+
+def auto_find_game_window():
+    """AUTO_GAME_KEYWORDS에 매칭되는 창을 자동 탐색. 없으면 None."""
+    for w in gw.getAllWindows():
+        try:
+            if not w.title or not w.visible:
+                continue
+            if w.width < 100 or w.height < 100:
+                continue
+            title_low = w.title.lower()
+            for kw in AUTO_GAME_KEYWORDS:
+                if kw in title_low:
+                    return w.title
+        except Exception:
+            continue
+    return None
+
+
+def auto_detect_buff_roi(bgr_img):
+    """게임 스크린샷 우측에서 버프 바를 자동 감지.
+
+    RO 버프 바는 우측 가장자리에 위치하며, 작은 정사각형 아이콘이
+    세로로 나열되어 있다. 타일 분석으로 세로 연속 아이콘 열을 찾는다.
+
+    반환: (x, y, w, h) 창 내부 상대좌표 또는 None
+    """
+    h, w = bgr_img.shape[:2]
+
+    # 우측 15% 스캔 (최소 100px)
+    scan_w = max(100, min(int(w * 0.15), w))
+    right = bgr_img[:, w - scan_w:]
+    gray = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+
+    bs = FALLBACK_ICON_SIZE  # 24px 타일
+    ny, nx = h // bs, scan_w // bs
+    if ny < 3 or nx < 1:
+        return None
+
+    # 각 타일의 표준편차 계산
+    tile_std = np.zeros((ny, nx))
+    for ty in range(ny):
+        for tx in range(nx):
+            tile = gray[ty * bs:(ty + 1) * bs, tx * bs:(tx + 1) * bs]
+            if tile.size > 0:
+                tile_std[ty, tx] = tile.std()
+
+    # std > 임계값 = "아이콘 후보"
+    icon_thresh = 15.0
+    is_icon = tile_std > icon_thresh
+
+    # 각 타일 열에서 가장 긴 세로 연속 아이콘 구간 찾기
+    best_col, best_run, best_y = -1, 0, 0
+    for tx in range(nx):
+        run_len, run_start = 0, 0
+        for ty in range(ny):
+            if is_icon[ty, tx]:
+                if run_len == 0:
+                    run_start = ty
+                run_len += 1
+            else:
+                if run_len > best_run:
+                    best_run, best_col, best_y = run_len, tx, run_start
+                run_len = 0
+        if run_len > best_run:
+            best_run, best_col, best_y = run_len, tx, run_start
+
+    if best_run < 3:  # 최소 3개 아이콘
+        return None
+
+    # 인접 열 확인 (2열 버프 바)
+    x_start, x_end = best_col, best_col
+    if best_col > 0:
+        adj = is_icon[best_y:best_y + best_run, best_col - 1]
+        if adj.sum() >= best_run * 0.5:
+            x_start = best_col - 1
+    if best_col + 1 < nx:
+        adj = is_icon[best_y:best_y + best_run, best_col + 1]
+        if adj.sum() >= best_run * 0.5:
+            x_end = best_col + 1
+
+    # 타일 좌표 → 픽셀 좌표 (러프)
+    roi_x = w - scan_w + x_start * bs
+    roi_y = best_y * bs
+    roi_w = (x_end - x_start + 1) * bs
+    roi_h = best_run * bs
+
+    # 세로가 가로의 2배 이상이어야 버프 바 (미니맵 등 제외)
+    if roi_h < roi_w * 2:
+        return None
+
+    # 정밀 보정: 러프 ROI 내부에서 실제 컨텐츠 경계 재탐색
+    rough = bgr_img[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+    g = cv2.cvtColor(rough, cv2.COLOR_BGR2GRAY)
+    row_blocks = _find_content_blocks(g.std(axis=1), min_length=8)
+    col_blocks = _find_content_blocks(g.std(axis=0), min_length=8)
+    if row_blocks and col_blocks:
+        ry1 = row_blocks[0][0]
+        ry2 = row_blocks[-1][0] + row_blocks[-1][1]
+        rx1 = col_blocks[0][0]
+        rx2 = col_blocks[-1][0] + col_blocks[-1][1]
+        roi_x += rx1
+        roi_y += ry1
+        roi_w = rx2 - rx1
+        roi_h = ry2 - ry1
+
+    # 최종 검증: 아이콘이 3개 이상 분리되는지 확인
+    final_roi = bgr_img[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+    icons = auto_split_icons(final_roi)
+    if len(icons) < 3:
+        return None
+
+    return (roi_x, roi_y, roi_w, roi_h)
 
 
 # --- 창 선택 다이얼로그 ------------------------------------------------------
@@ -636,12 +750,37 @@ def main():
         info.config(text=f"창: {w}   |   ROI: {r}   |   템플릿: {t}개")
     refresh_info()
 
+    # --- 시작 시 자동 탐색 ---------------------------------------------------
+    if not state["window_title"]:
+        auto_title = auto_find_game_window()
+        if auto_title:
+            state["window_title"] = auto_title
+            save_config(state); refresh_info()
+            status.config(text=f"자동 감지: {auto_title}", fg="blue")
+
+    if state["window_title"] and not state["roi_rel"]:
+        rect = get_window_rect(state["window_title"])
+        if rect:
+            img = grab_rect(rect)
+            roi = auto_detect_buff_roi(img)
+            if roi:
+                state["roi_rel"] = roi
+                save_config(state); refresh_info()
+                status.config(text=f"창+ROI 자동 감지 완료", fg="blue")
+
     def do_pick_window():
-        t = pick_window_dialog(root)
+        # 자동 탐색 시도 → 실패 시 수동 선택
+        t = auto_find_game_window()
         if t:
             state["window_title"] = t
             save_config(state); refresh_info()
-            status.config(text=f"창 연결: {t}", fg="blue")
+            status.config(text=f"자동 감지: {t}", fg="blue")
+        else:
+            t = pick_window_dialog(root)
+            if t:
+                state["window_title"] = t
+                save_config(state); refresh_info()
+                status.config(text=f"창 연결: {t}", fg="blue")
 
     def do_pick_roi():
         if not state["window_title"]:
@@ -652,11 +791,18 @@ def main():
             messagebox.showerror("에러", "창을 찾지 못했어요. 창모드 확인.")
             return
         img = grab_rect(rect)
-        roi = pick_roi_on_image(img, root)
+        # 자동 감지 시도 → 실패 시 수동 드래그
+        roi = auto_detect_buff_roi(img)
         if roi:
             state["roi_rel"] = roi
             save_config(state); refresh_info()
-            status.config(text="ROI 지정됨", fg="blue")
+            status.config(text=f"ROI 자동 감지됨 {roi}", fg="blue")
+        else:
+            roi = pick_roi_on_image(img, root)
+            if roi:
+                state["roi_rel"] = roi
+                save_config(state); refresh_info()
+                status.config(text="ROI 수동 지정됨", fg="blue")
 
     def do_save():
         if not (state["window_title"] and state["roi_rel"]):
