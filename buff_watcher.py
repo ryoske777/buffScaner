@@ -423,8 +423,8 @@ def _estimate_grid_params(std_signal, expected_size=None, min_length=8):
 
 def auto_split_icons(roi_img, empty_std_threshold=15.0):
     """아이콘이 정사각형이라고 가정하고 ROI를 격자로 분할.
-    1) 행/열 분석으로 아이콘 크기 + 간격(피치) 추정
-    2) 피치 간격으로 격자 생성 (간격 고려)
+    1) 세로 분석으로 아이콘 크기 + 세로 피치 추정
+    2) 개별 행 스트립의 가로 프로파일로 열 위치 결정 (2열 정확도 개선)
     3) 편차 낮은 셀(빈 칸)은 제외
 
     반환: [(col, row, bgr_img), ...]"""
@@ -437,24 +437,54 @@ def auto_split_icons(roi_img, empty_std_threshold=15.0):
     row_std = gray.std(axis=1)
     cell_h, step_y, y_off = _estimate_grid_params(row_std)
 
-    # 아이콘은 정사각형 → 세로 기준 크기 우선 사용
     size = cell_h or FALLBACK_ICON_SIZE
     if size < 12:
         size = FALLBACK_ICON_SIZE
-
-    # 가로(열) 분석 — expected_size 전달하여 합쳐진 블록 세분화
-    col_std = gray.std(axis=0)
-    _cw, step_x, x_off = _estimate_grid_params(col_std, expected_size=size)
-
     step_y = step_y or size
-    step_x = step_x or size
 
-    # ROI가 너무 작으면 포기
     if H < size or W < size:
         return []
 
-    # 그리드 셀 수 계산 (첫 아이콘 시작 + 피치 * n이 ROI 안에 들어오는 수)
     rows = 1 + max(0, (H - y_off - size) // step_y) if step_y > 0 else 1
+
+    # --- 가로 분석: 상위 행 스트립의 가로 프로파일 평균 사용 ---
+    # 전체 ROI 높이의 col_std 대신, 개별 행 스트립을 분석하면
+    # 2열 사이 작은 간격이 훨씬 명확하게 보인다.
+    row_scores = []
+    for r in range(rows):
+        y1 = y_off + r * step_y
+        if y1 + size > H:
+            continue
+        strip = gray[y1:y1 + size, :]
+        row_scores.append((strip.std(), r))
+    row_scores.sort(reverse=True)
+
+    n_samples = min(3, len(row_scores))
+    if n_samples == 0:
+        return []
+
+    avg_col_profile = np.zeros(W, dtype=np.float64)
+    for _, r in row_scores[:n_samples]:
+        y1 = y_off + r * step_y
+        strip = gray[y1:y1 + size, :]
+        avg_col_profile += strip.std(axis=0)
+    avg_col_profile /= n_samples
+
+    _cw, step_x, x_off = _estimate_grid_params(avg_col_profile,
+                                                 expected_size=size)
+
+    # 폴백: 가로 분석 실패 시 ROI 폭과 아이콘 크기로 열 수 추정
+    if step_x is None or step_x < size:
+        n_cols = max(1, round(W / size))
+        if n_cols == 1:
+            step_x = size
+            x_off = max(0, (W - size) // 2)
+        else:
+            step_x = (W - size) // (n_cols - 1)
+            x_off = 0
+    else:
+        step_x = step_x or size
+
     cols = 1 + max(0, (W - x_off - size) // step_x) if step_x > 0 else 1
 
     icons = []
@@ -552,12 +582,19 @@ def review_dialog(parent, saved_icons):
     win = tk.Toplevel(parent)
     win.title("자동 분리 결과 확인")
     win.attributes("-topmost", True)
-    win.geometry("700x520")
+
+    # 아이콘 표시 크기 결정 (최소 48px로 확대)
+    display_px = 56
+    grid_cols = min(10, len(saved_icons))
+    cell_px = display_px + 14  # border + padding
+    need_w = max(500, grid_cols * cell_px + 80)
+    need_w = min(need_w, parent.winfo_screenwidth() - 100)
+    win.geometry(f"{need_w}x600")
 
     tk.Label(win,
              text=(f"총 {len(saved_icons)}개 감지됨. "
                    "잘못 잡힌 항목은 클릭(빨강)해서 제외하세요."),
-             fg="gray", wraplength=660, justify="left").pack(pady=6, padx=10, anchor="w")
+             fg="gray", wraplength=need_w - 40, justify="left").pack(pady=6, padx=10, anchor="w")
 
     area = tk.Canvas(win, highlightthickness=0)
     sb = tk.Scrollbar(win, orient="vertical", command=area.yview)
@@ -572,10 +609,10 @@ def review_dialog(parent, saved_icons):
     area.bind_all("<MouseWheel>", wheel)
 
     keep, frames, photos = {}, {}, []
-    cols = 10
+    cols = grid_cols
     for i, (name, img) in enumerate(saved_icons):
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        k = max(1, 40 // max(rgb.shape[0], 1))
+        k = max(1, display_px // max(rgb.shape[0], rgb.shape[1], 1))
         if k > 1:
             rgb = cv2.resize(rgb, None, fx=k, fy=k, interpolation=cv2.INTER_NEAREST)
         ph = ImageTk.PhotoImage(Image.fromarray(rgb))
