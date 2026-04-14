@@ -31,7 +31,7 @@ ICONS_DIR.mkdir(exist_ok=True)
 
 FALLBACK_ICON_SIZE = 24
 MATCH_THRESHOLD = 0.70
-WATCH_INTERVAL = 1.5
+WATCH_INTERVAL = 0.5
 CONFIRM_TICKS = 2
 THUMB_SIZE = 24
 AUTO_GAME_KEYWORDS = ["ragnarok"]  # 자동 탐색할 게임 창 키워드
@@ -641,6 +641,7 @@ class Watcher:
         self.roi_rel = roi_rel
         self.saved = saved  # [(name, img, sig)]
         self.running = False
+        self.last_positions = {}  # name → (x, y) 이전 매칭 위치 캐시
         self.pending_missing = None
         self.stable_count = 0
         self.current_missing = set()
@@ -673,28 +674,63 @@ class Watcher:
                     icon_size = self.saved[0][1].shape[0] if self.saved \
                         else FALLBACK_ICON_SIZE
 
-                    # --- 슬라이딩 윈도우 매칭 ---
-                    # 격자 분할 대신 ROI 전체를 슬라이딩하며 각 템플릿 탐색
-                    # → 아이콘 순서/위치가 바뀌어도 정확히 매칭
+                    # --- 슬라이딩 윈도우 매칭 (위치 캐싱 최적화) ---
                     missing_detail = []
-                    step = max(2, icon_size // 6)
 
                     if h_roi < icon_size or w_roi < icon_size:
                         missing_detail = [(n, i) for n, i, _ in self.saved]
                     else:
+                        m = max(1, icon_size // 5)
+                        coarse = max(2, icon_size // 3)  # 전체 스캔용
+                        fine = 2                          # 캐시 근처 탐색용
+
+                        def _match(y, x, sig):
+                            """인라인 히스토그램 비교 (함수 호출 오버헤드 제거)."""
+                            core = roi_img[y + m:y + icon_size - m,
+                                           x + m:x + icon_size - m]
+                            if core.size == 0:
+                                return 0.0
+                            cr = cv2.resize(core, (16, 16),
+                                            interpolation=cv2.INTER_AREA)
+                            hsv = cv2.cvtColor(cr, cv2.COLOR_BGR2HSV)
+                            h = cv2.calcHist([hsv], [0, 1], None,
+                                             [12, 12], [0, 180, 0, 256])
+                            cv2.normalize(h, h, 0, 1, cv2.NORM_MINMAX)
+                            return float(cv2.compareHist(
+                                sig, h.astype(np.float32),
+                                cv2.HISTCMP_CORREL))
+
                         for name, img, sig in self.saved:
                             found = False
-                            for y in range(0, h_roi - icon_size + 1, step):
-                                for x in range(0, w_roi - icon_size + 1, step):
-                                    patch = roi_img[y:y + icon_size,
-                                                    x:x + icon_size]
-                                    ps = icon_signature(patch)
-                                    if sig_score(sig, ps) >= MATCH_THRESHOLD:
-                                        found = True
+
+                            # 1) 이전 위치 근처 먼저 확인 (대부분 여기서 끝남)
+                            if name in self.last_positions:
+                                lx, ly = self.last_positions[name]
+                                for dy in range(-fine * 2, fine * 2 + 1, fine):
+                                    for dx in range(-fine * 2, fine * 2 + 1, fine):
+                                        ny, nx = ly + dy, lx + dx
+                                        if (0 <= ny <= h_roi - icon_size and
+                                                0 <= nx <= w_roi - icon_size):
+                                            if _match(ny, nx, sig) >= MATCH_THRESHOLD:
+                                                self.last_positions[name] = (nx, ny)
+                                                found = True
+                                                break
+                                    if found:
                                         break
-                                if found:
-                                    break
+
+                            # 2) 못 찾으면 전체 ROI 스캔 (큰 스텝)
                             if not found:
+                                for y in range(0, h_roi - icon_size + 1, coarse):
+                                    for x in range(0, w_roi - icon_size + 1, coarse):
+                                        if _match(y, x, sig) >= MATCH_THRESHOLD:
+                                            self.last_positions[name] = (x, y)
+                                            found = True
+                                            break
+                                    if found:
+                                        break
+
+                            if not found:
+                                self.last_positions.pop(name, None)
                                 missing_detail.append((name, img))
 
                     present_count = len(self.saved) - len(missing_detail)
